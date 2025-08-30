@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(rustdoc::missing_crate_level_docs)]
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use eframe::egui;
 use std::collections::HashMap;
@@ -9,7 +10,26 @@ use std::time::SystemTime;
 use egui::FontFamily;
 use egui::FontDefinitions;
 use egui::FontData;
+
+// 메뉴 액션을 위한 열거형
+#[derive(Debug, Clone)]
+enum MenuAction {
+    NewScan,
+    ShowPreferences,
+    About,
+    Quit,
+    ShowHelp,
+    Export,
+}
+
 fn main() -> eframe::Result {
+    // 메뉴 액션을 위한 채널 생성
+    let (menu_tx, menu_rx) = mpsc::channel::<MenuAction>();
+
+    // macOS 메뉴바 설정
+    #[cfg(target_os = "macos")]
+    setup_macos_menu(menu_tx.clone()).expect("메뉴바 설정 실패");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
@@ -21,16 +41,96 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "MacSweep",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             // 다크 모드 설정
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             
             // 한국어 폰트 설정
             setup_fonts(&cc.egui_ctx);
             
-            Ok(Box::<CacheCleanerApp>::default())
+            Ok(Box::new(CacheCleanerApp::new(menu_rx)))
         }),
     )
+}
+
+#[cfg(target_os = "macos")]
+fn setup_macos_menu(menu_tx: mpsc::Sender<MenuAction>) -> Result<(), Box<dyn std::error::Error>> {
+    use muda::{Menu, MenuItem, Submenu, accelerator::Accelerator};
+
+    let menu = Menu::new();
+
+    // MacSweep 메뉴 (앱 메뉴)
+    let app_menu = Submenu::new("MacSweep", true);
+    
+    let about_item = MenuItem::new("MacSweep 정보", true, Some(Accelerator::new(Some(muda::accelerator::Modifiers::META), muda::accelerator::Code::Comma)));
+    let about_item_id = about_item.id().clone();
+    app_menu.append(&about_item)?;
+    
+    let prefs_item = MenuItem::new("환경설정...", true, Some(Accelerator::new(Some(muda::accelerator::Modifiers::META), muda::accelerator::Code::Comma)));
+    let prefs_item_id = prefs_item.id().clone();
+    app_menu.append(&prefs_item)?;
+    
+    let quit_item = MenuItem::new("MacSweep 종료", true, Some(Accelerator::new(Some(muda::accelerator::Modifiers::META), muda::accelerator::Code::KeyQ)));
+    let quit_item_id = quit_item.id().clone();
+    app_menu.append(&quit_item)?;
+
+    // 파일 메뉴
+    let file_menu = Submenu::new("파일", true);
+    
+    let new_scan_item = MenuItem::new("새 스캔", true, Some(Accelerator::new(Some(muda::accelerator::Modifiers::META), muda::accelerator::Code::KeyN)));
+    let new_scan_item_id = new_scan_item.id().clone();
+    file_menu.append(&new_scan_item)?;
+    
+    let export_item = MenuItem::new("결과 내보내기...", true, Some(Accelerator::new(Some(muda::accelerator::Modifiers::META), muda::accelerator::Code::KeyE)));
+    let export_item_id = export_item.id().clone();
+    file_menu.append(&export_item)?;
+
+    // 도움말 메뉴
+    let help_menu = Submenu::new("도움말", true);
+    
+    let help_item = MenuItem::new("MacSweep 도움말", true, None);
+    let help_item_id = help_item.id().clone();
+    help_menu.append(&help_item)?;
+
+    // 메뉴를 메뉴바에 추가
+    menu.append(&app_menu)?;
+    menu.append(&file_menu)?;
+    menu.append(&help_menu)?;
+
+    // macOS 앱에 메뉴 설정
+    menu.init_for_nsapp();
+
+    // 메뉴를 정적으로 유지하기 위해 Box로 leak
+    Box::leak(Box::new(menu));
+    Box::leak(Box::new(about_item));
+    Box::leak(Box::new(prefs_item));
+    Box::leak(Box::new(quit_item));
+    Box::leak(Box::new(new_scan_item));
+    Box::leak(Box::new(export_item));
+    Box::leak(Box::new(help_item));
+
+    // 메뉴 이벤트 리스너 설정
+    std::thread::spawn(move || {
+        use muda::MenuEvent;
+        
+        MenuEvent::receiver().iter().for_each(|event| {
+            let action = match event.id {
+                id if id == about_item_id => Some(MenuAction::About),
+                id if id == prefs_item_id => Some(MenuAction::ShowPreferences),
+                id if id == quit_item_id => Some(MenuAction::Quit),
+                id if id == new_scan_item_id => Some(MenuAction::NewScan),
+                id if id == export_item_id => Some(MenuAction::Export),
+                id if id == help_item_id => Some(MenuAction::ShowHelp),
+                _ => None
+            };
+            
+            if let Some(action) = action {
+                let _ = menu_tx.send(action);
+            }
+        });
+    });
+
+    Ok(())
 }
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -57,8 +157,6 @@ fn setup_fonts(ctx: &egui::Context) {
         .unwrap()
         .insert(0, "nanum_gothic".to_owned());
 
-
-    
     ctx.set_fonts(fonts);
 }
 
@@ -140,10 +238,14 @@ struct CacheCleanerApp {
     auto_select_safe: bool,
     dry_run: bool,
     last_scan_time: Option<SystemTime>,
+    menu_receiver: mpsc::Receiver<MenuAction>,
+    show_about_dialog: bool,
+    show_preferences_dialog: bool,
+    show_help_dialog: bool,
 }
 
-impl Default for CacheCleanerApp {
-    fn default() -> Self {
+impl CacheCleanerApp {
+    fn new(menu_receiver: mpsc::Receiver<MenuAction>) -> Self {
         let mut selected_types = HashMap::new();
         selected_types.insert(CacheType::User, true);
         selected_types.insert(CacheType::Developer, true);
@@ -174,6 +276,10 @@ impl Default for CacheCleanerApp {
             auto_select_safe: true,
             dry_run: false,
             last_scan_time: None,
+            menu_receiver,
+            show_about_dialog: false,
+            show_preferences_dialog: false,
+            show_help_dialog: false,
         };
         
         // 샘플 데이터 생성 (실제 구현에서는 실제 스캔 로직으로 대체)
@@ -181,9 +287,120 @@ impl Default for CacheCleanerApp {
         app.update_filtered_items();
         app
     }
-}
 
-impl CacheCleanerApp {
+    fn handle_menu_events(&mut self) {
+        while let Ok(action) = self.menu_receiver.try_recv() {
+            match action {
+                MenuAction::NewScan => {
+                    if matches!(self.state, AppState::Ready) {
+                        self.start_scan();
+                    }
+                },
+                MenuAction::ShowPreferences => {
+                    self.show_preferences_dialog = true;
+                },
+                MenuAction::About => {
+                    self.show_about_dialog = true;
+                },
+                MenuAction::Quit => {
+                    std::process::exit(0);
+                },
+                MenuAction::ShowHelp => {
+                    self.show_help_dialog = true;
+                },
+                MenuAction::Export => {
+                    // TODO: 결과 내보내기 구현
+                    println!("결과 내보내기 기능");
+                },
+            }
+        }
+    }
+
+    fn show_dialogs(&mut self, ctx: &egui::Context) {
+        // About 다이얼로그
+        if self.show_about_dialog {
+            egui::Window::new("MacSweep 정보")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("🧹 MacSweep").size(24.0));
+                        ui.add_space(10.0);
+                        ui.label("버전 1.0.0");
+                        ui.label("macOS를 위한 스마트 캐시 클리너");
+                        ui.add_space(10.0);
+                        ui.label("© 2025 MacSweep");
+                        ui.add_space(10.0);
+                        
+                        if ui.button("확인").clicked() {
+                            self.show_about_dialog = false;
+                        }
+                    });
+                });
+        }
+
+        // 환경설정 다이얼로그
+        if self.show_preferences_dialog {
+            egui::Window::new("환경설정")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.group(|ui| {
+                        ui.vertical(|ui| {
+                            ui.strong("스캔 옵션");
+                            ui.checkbox(&mut self.auto_select_safe, "안전한 항목 자동 선택");
+                            ui.checkbox(&mut self.show_unsafe, "위험한 항목도 표시");
+                            ui.checkbox(&mut self.sort_by_size, "크기순으로 정렬");
+                        });
+                    });
+                    
+                    ui.add_space(10.0);
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("확인").clicked() {
+                            self.show_preferences_dialog = false;
+                            self.update_filtered_items();
+                        }
+                        if ui.button("취소").clicked() {
+                            self.show_preferences_dialog = false;
+                        }
+                    });
+                });
+        }
+
+        // 도움말 다이얼로그
+        if self.show_help_dialog {
+            egui::Window::new("MacSweep 도움말")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(400.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.strong("MacSweep 사용법");
+                        ui.add_space(10.0);
+                        
+                        ui.label("1. '다시 스캔' 버튼을 클릭하여 시스템을 스캔합니다.");
+                        ui.label("2. 왼쪽 사이드바에서 캐시 유형을 선택합니다.");
+                        ui.label("3. 정리할 항목들을 체크합니다.");
+                        ui.label("4. '정리 시작' 버튼을 클릭합니다.");
+                        
+                        ui.add_space(10.0);
+                        ui.strong("안전성");
+                        ui.label("• ⚠️ 표시가 있는 항목은 신중하게 선택하세요.");
+                        ui.label("• 시스템 캐시는 기본적으로 비활성화되어 있습니다.");
+                        ui.label("• 테스트 모드를 사용하여 먼저 확인해보세요.");
+                    });
+                    
+                    ui.add_space(10.0);
+                    if ui.button("닫기").clicked() {
+                        self.show_help_dialog = false;
+                    }
+                });
+        }
+    }
+    
+    // 나머지 메서드들은 동일하게 유지...
     fn generate_sample_data(&mut self) {
         // 실제 macOS 캐시 경로들을 시뮬레이션
         let sample_caches = vec![
@@ -319,9 +536,13 @@ impl CacheCleanerApp {
 
 impl eframe::App for CacheCleanerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 상단 메뉴바
+        // 메뉴 이벤트 처리
+        self.handle_menu_events();
 
+        // 다이얼로그 표시
+        self.show_dialogs(ctx);
         
+        // 상단 메뉴바
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.add_space(5.0);
             ui.horizontal(|ui| {
