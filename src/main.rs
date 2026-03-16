@@ -1,163 +1,38 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(rustdoc::missing_crate_level_docs)]
-use std::sync::Arc;
-use std::sync::mpsc;
 
-use eframe::egui;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use egui::FontFamily;
-use egui::FontDefinitions;
-use egui::FontData;
 
-// 메뉴 액션을 위한 열거형
-#[derive(Debug, Clone)]
-enum MenuAction {
-    NewScan,
-    ShowPreferences,
-    About,
-    Quit,
-    ShowHelp,
-    Export,
+use dirs::home_dir;
+use gpui::{
+    App, Bounds, Context, MouseButton, Window, WindowBounds, WindowOptions, div, px, rgb, size,
+    white, black, prelude::*,
+};
+use gpui_platform::application;
+use sysinfo::System;
+use walkdir::WalkDir;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum CacheType {
+    User,
+    Developer,
+    Browser,
+    Application,
+    System,
 }
 
-fn main() -> eframe::Result {
-    // 메뉴 액션을 위한 채널 생성
-    let (menu_tx, menu_rx) = mpsc::channel::<MenuAction>();
-
-    // macOS 메뉴바 설정
-    #[cfg(target_os = "macos")]
-    setup_macos_menu(menu_tx.clone()).expect("메뉴바 설정 실패");
-
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 900.0])
-            .with_title("MacSweep - Cache Cleaner")
-            .with_min_inner_size([1000.0, 600.0]),
-        ..Default::default()
-    };
-    
-    eframe::run_native(
-        "MacSweep",
-        options,
-        Box::new(move |cc| {
-            // 다크 모드 설정
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            
-            // 한국어 폰트 설정
-            setup_fonts(&cc.egui_ctx);
-            
-            Ok(Box::new(CacheCleanerApp::new(menu_rx)))
-        }),
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn setup_macos_menu(menu_tx: mpsc::Sender<MenuAction>) -> Result<(), Box<dyn std::error::Error>> {
-    use muda::{Menu, MenuItem, Submenu, accelerator::Accelerator};
-
-    let menu = Menu::new();
-
-    // MacSweep 메뉴 (앱 메뉴)
-    let app_menu = Submenu::new("MacSweep", true);
-    
-    let about_item = MenuItem::new("MacSweep 정보", true, Some(Accelerator::new(Some(muda::accelerator::Modifiers::META), muda::accelerator::Code::Comma)));
-    let about_item_id = about_item.id().clone();
-    app_menu.append(&about_item)?;
-    
-    let prefs_item = MenuItem::new("환경설정...", true, Some(Accelerator::new(Some(muda::accelerator::Modifiers::META), muda::accelerator::Code::Comma)));
-    let prefs_item_id = prefs_item.id().clone();
-    app_menu.append(&prefs_item)?;
-    
-    let quit_item = MenuItem::new("MacSweep 종료", true, Some(Accelerator::new(Some(muda::accelerator::Modifiers::META), muda::accelerator::Code::KeyQ)));
-    let quit_item_id = quit_item.id().clone();
-    app_menu.append(&quit_item)?;
-
-    // 파일 메뉴
-    let file_menu = Submenu::new("파일", true);
-    
-    let new_scan_item = MenuItem::new("새 스캔", true, Some(Accelerator::new(Some(muda::accelerator::Modifiers::META), muda::accelerator::Code::KeyN)));
-    let new_scan_item_id = new_scan_item.id().clone();
-    file_menu.append(&new_scan_item)?;
-    
-    let export_item = MenuItem::new("결과 내보내기...", true, Some(Accelerator::new(Some(muda::accelerator::Modifiers::META), muda::accelerator::Code::KeyE)));
-    let export_item_id = export_item.id().clone();
-    file_menu.append(&export_item)?;
-
-    // 도움말 메뉴
-    let help_menu = Submenu::new("도움말", true);
-    
-    let help_item = MenuItem::new("MacSweep 도움말", true, None);
-    let help_item_id = help_item.id().clone();
-    help_menu.append(&help_item)?;
-
-    // 메뉴를 메뉴바에 추가
-    menu.append(&app_menu)?;
-    menu.append(&file_menu)?;
-    menu.append(&help_menu)?;
-
-    // macOS 앱에 메뉴 설정
-    menu.init_for_nsapp();
-
-    // 메뉴를 정적으로 유지하기 위해 Box로 leak
-    Box::leak(Box::new(menu));
-    Box::leak(Box::new(about_item));
-    Box::leak(Box::new(prefs_item));
-    Box::leak(Box::new(quit_item));
-    Box::leak(Box::new(new_scan_item));
-    Box::leak(Box::new(export_item));
-    Box::leak(Box::new(help_item));
-
-    // 메뉴 이벤트 리스너 설정
-    std::thread::spawn(move || {
-        use muda::MenuEvent;
-        
-        MenuEvent::receiver().iter().for_each(|event| {
-            let action = match event.id {
-                id if id == about_item_id => Some(MenuAction::About),
-                id if id == prefs_item_id => Some(MenuAction::ShowPreferences),
-                id if id == quit_item_id => Some(MenuAction::Quit),
-                id if id == new_scan_item_id => Some(MenuAction::NewScan),
-                id if id == export_item_id => Some(MenuAction::Export),
-                id if id == help_item_id => Some(MenuAction::ShowHelp),
-                _ => None
-            };
-            
-            if let Some(action) = action {
-                let _ = menu_tx.send(action);
-            }
-        });
-    });
-
-    Ok(())
-}
-
-fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-    
-    // 한국어 폰트 데이터 추가
-    // 실제 폰트 파일 경로: assets/korean_font.ttf
-    
-    let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert(
-        "nanum_gothic".to_owned(),
-        FontData::from_static(include_bytes!("../assets/fonts/NanumGothic-Bold.ttf")).into(),
-    );
-
-    fonts
-        .families
-        .get_mut(&FontFamily::Proportional)
-        .unwrap()
-        .insert(0, "nanum_gothic".to_owned());
-
-    fonts
-        .families
-        .get_mut(&FontFamily::Monospace)
-        .unwrap()
-        .insert(0, "nanum_gothic".to_owned());
-
-    ctx.set_fonts(fonts);
+impl CacheType {
+    fn label(&self) -> &'static str {
+        match self {
+            CacheType::User => "User",
+            CacheType::Developer => "Developer",
+            CacheType::Browser => "Browser",
+            CacheType::Application => "Application",
+            CacheType::System => "System",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -172,713 +47,455 @@ struct CacheItem {
     description: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum CacheType {
-    System,
-    User,
-    Developer,
-    Browser,
-    Application,
-}
-
-impl CacheType {
-    fn color(&self) -> egui::Color32 {
-        match self {
-            CacheType::System => egui::Color32::from_rgb(255, 107, 107),     // 빨강
-            CacheType::User => egui::Color32::from_rgb(116, 185, 255),       // 파랑
-            CacheType::Developer => egui::Color32::from_rgb(162, 255, 178),  // 초록
-            CacheType::Browser => egui::Color32::from_rgb(255, 177, 66),     // 주황
-            CacheType::Application => egui::Color32::from_rgb(186, 85, 211), // 보라
-        }
-    }
-    
-    fn icon(&self) -> &'static str {
-        match self {
-            CacheType::System => "⚙️",
-            CacheType::User => "👤",
-            CacheType::Developer => "💻",
-            CacheType::Browser => "🌐",
-            CacheType::Application => "📱",
-        }
-    }
-}
-
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AppState {
+    Idle,
     Scanning,
-    Ready,
     Cleaning,
     Complete,
 }
 
-struct ScanProgress {
-    current_path: String,
-    scanned_items: usize,
-    total_size: u64,
-    progress: f32,
+struct MemoryInfo {
+    total: u64,
+    used: u64,
 }
 
 struct CleaningStats {
     items_cleaned: usize,
     bytes_freed: u64,
-    time_taken: f32,
     errors: Vec<String>,
 }
 
-struct CacheCleanerApp {
+struct CacheCleanerView {
     state: AppState,
     cache_items: Vec<CacheItem>,
-    filtered_items: Vec<CacheItem>,
-    scan_progress: ScanProgress,
-    cleaning_stats: CleaningStats,
-    filter_text: String,
+    filtered_indices: Vec<usize>,
     selected_types: HashMap<CacheType, bool>,
     show_unsafe: bool,
     sort_by_size: bool,
     auto_select_safe: bool,
     dry_run: bool,
     last_scan_time: Option<SystemTime>,
-    menu_receiver: mpsc::Receiver<MenuAction>,
-    show_about_dialog: bool,
-    show_preferences_dialog: bool,
-    show_help_dialog: bool,
+    memory: MemoryInfo,
+    cleaning_stats: CleaningStats,
 }
 
-impl CacheCleanerApp {
-    fn new(menu_receiver: mpsc::Receiver<MenuAction>) -> Self {
+impl CacheCleanerView {
+    fn new(_cx: &mut Context<Self>) -> Self {
         let mut selected_types = HashMap::new();
         selected_types.insert(CacheType::User, true);
         selected_types.insert(CacheType::Developer, true);
         selected_types.insert(CacheType::Browser, true);
         selected_types.insert(CacheType::Application, true);
-        selected_types.insert(CacheType::System, false); // 기본적으로 시스템 캐시는 비활성화
-        
-        let mut app = Self {
-            state: AppState::Ready,
+        selected_types.insert(CacheType::System, false);
+
+        let mut view = Self {
+            state: AppState::Idle,
             cache_items: Vec::new(),
-            filtered_items: Vec::new(),
-            scan_progress: ScanProgress {
-                current_path: String::new(),
-                scanned_items: 0,
-                total_size: 0,
-                progress: 0.0,
-            },
-            cleaning_stats: CleaningStats {
-                items_cleaned: 0,
-                bytes_freed: 0,
-                time_taken: 0.0,
-                errors: Vec::new(),
-            },
-            filter_text: String::new(),
+            filtered_indices: Vec::new(),
             selected_types,
             show_unsafe: false,
             sort_by_size: true,
             auto_select_safe: true,
-            dry_run: false,
+            dry_run: true,
             last_scan_time: None,
-            menu_receiver,
-            show_about_dialog: false,
-            show_preferences_dialog: false,
-            show_help_dialog: false,
+            memory: MemoryInfo { total: 0, used: 0 },
+            cleaning_stats: CleaningStats {
+                items_cleaned: 0,
+                bytes_freed: 0,
+                errors: Vec::new(),
+            },
         };
-        
-        // 샘플 데이터 생성 (실제 구현에서는 실제 스캔 로직으로 대체)
-        app.generate_sample_data();
-        app.update_filtered_items();
-        app
+
+        view.refresh_memory();
+        view.scan_caches();
+        view
     }
 
-    fn handle_menu_events(&mut self) {
-        while let Ok(action) = self.menu_receiver.try_recv() {
-            match action {
-                MenuAction::NewScan => {
-                    if matches!(self.state, AppState::Ready) {
-                        self.start_scan();
+    fn refresh_memory(&mut self) {
+        let mut system = System::new_all();
+        system.refresh_memory();
+        self.memory = MemoryInfo {
+            total: system.total_memory(),
+            used: system.used_memory(),
+        };
+    }
+
+    fn scan_caches(&mut self) {
+        self.state = AppState::Scanning;
+        self.cache_items.clear();
+
+        let cache_root = match home_dir() {
+            Some(home) => home.join("Library/Caches"),
+            None => {
+                self.state = AppState::Idle;
+                return;
+            }
+        };
+
+        if cache_root.exists() {
+            if let Ok(entries) = std::fs::read_dir(&cache_root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
                     }
-                },
-                MenuAction::ShowPreferences => {
-                    self.show_preferences_dialog = true;
-                },
-                MenuAction::About => {
-                    self.show_about_dialog = true;
-                },
-                MenuAction::Quit => {
-                    std::process::exit(0);
-                },
-                MenuAction::ShowHelp => {
-                    self.show_help_dialog = true;
-                },
-                MenuAction::Export => {
-                    // TODO: 결과 내보내기 구현
-                    println!("결과 내보내기 기능");
-                },
+
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("(unknown)")
+                        .to_string();
+
+                    let size = dir_size(&path);
+                    let last_modified = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(SystemTime::now());
+
+                    let item_type = classify_cache(&name);
+                    let is_safe = item_type != CacheType::System;
+
+                    self.cache_items.push(CacheItem {
+                        path: path.clone(),
+                        name,
+                        size,
+                        last_modified,
+                        item_type,
+                        is_selected: is_safe && self.auto_select_safe,
+                        is_safe,
+                        description: "macOS cache directory".to_string(),
+                    });
+                }
             }
         }
-    }
 
-    fn show_dialogs(&mut self, ctx: &egui::Context) {
-        // About 다이얼로그
-        if self.show_about_dialog {
-            egui::Window::new("MacSweep 정보")
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(10.0);
-                        ui.label(egui::RichText::new("🧹 MacSweep").size(24.0));
-                        ui.add_space(10.0);
-                        ui.label("버전 1.0.0");
-                        ui.label("macOS를 위한 스마트 캐시 클리너");
-                        ui.add_space(10.0);
-                        ui.label("© 2025 MacSweep");
-                        ui.add_space(10.0);
-                        
-                        if ui.button("확인").clicked() {
-                            self.show_about_dialog = false;
-                        }
-                    });
-                });
-        }
-
-        // 환경설정 다이얼로그
-        if self.show_preferences_dialog {
-            egui::Window::new("환경설정")
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.group(|ui| {
-                        ui.vertical(|ui| {
-                            ui.strong("스캔 옵션");
-                            ui.checkbox(&mut self.auto_select_safe, "안전한 항목 자동 선택");
-                            ui.checkbox(&mut self.show_unsafe, "위험한 항목도 표시");
-                            ui.checkbox(&mut self.sort_by_size, "크기순으로 정렬");
-                        });
-                    });
-                    
-                    ui.add_space(10.0);
-                    
-                    ui.horizontal(|ui| {
-                        if ui.button("확인").clicked() {
-                            self.show_preferences_dialog = false;
-                            self.update_filtered_items();
-                        }
-                        if ui.button("취소").clicked() {
-                            self.show_preferences_dialog = false;
-                        }
-                    });
-                });
-        }
-
-        // 도움말 다이얼로그
-        if self.show_help_dialog {
-            egui::Window::new("MacSweep 도움말")
-                .collapsible(false)
-                .resizable(true)
-                .default_width(400.0)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.strong("MacSweep 사용법");
-                        ui.add_space(10.0);
-                        
-                        ui.label("1. '다시 스캔' 버튼을 클릭하여 시스템을 스캔합니다.");
-                        ui.label("2. 왼쪽 사이드바에서 캐시 유형을 선택합니다.");
-                        ui.label("3. 정리할 항목들을 체크합니다.");
-                        ui.label("4. '정리 시작' 버튼을 클릭합니다.");
-                        
-                        ui.add_space(10.0);
-                        ui.strong("안전성");
-                        ui.label("• ⚠️ 표시가 있는 항목은 신중하게 선택하세요.");
-                        ui.label("• 시스템 캐시는 기본적으로 비활성화되어 있습니다.");
-                        ui.label("• 테스트 모드를 사용하여 먼저 확인해보세요.");
-                    });
-                    
-                    ui.add_space(10.0);
-                    if ui.button("닫기").clicked() {
-                        self.show_help_dialog = false;
-                    }
-                });
-        }
-    }
-    
-    // 나머지 메서드들은 동일하게 유지...
-    fn generate_sample_data(&mut self) {
-        // 실제 macOS 캐시 경로들을 시뮬레이션
-        let sample_caches = vec![
-            ("Safari/WebKit", CacheType::Browser, 245_000_000, true, "Safari 웹 캐시"),
-            ("Chrome/Default/Cache", CacheType::Browser, 890_000_000, true, "Chrome 브라우저 캐시"),
-            ("Xcode/DerivedData", CacheType::Developer, 1_200_000_000, true, "Xcode 빌드 캐시"),
-            ("com.apple.dt.Xcode", CacheType::Developer, 450_000_000, true, "Xcode 도구 캐시"),
-            ("npm/_cacache", CacheType::Developer, 320_000_000, true, "NPM 패키지 캐시"),
-            ("Homebrew/downloads", CacheType::Developer, 180_000_000, true, "Homebrew 다운로드"),
-            ("cargo/registry/cache", CacheType::Developer, 567_000_000, true, "Rust Cargo 캐시"),
-            ("com.apple.Safari", CacheType::User, 125_000_000, true, "Safari 사용자 캐시"),
-            ("com.spotify.client", CacheType::Application, 234_000_000, true, "Spotify 캐시"),
-            ("com.adobe.Creative Cloud", CacheType::Application, 678_000_000, true, "Adobe 크리에이티브 클라우드"),
-            ("com.apple.security", CacheType::System, 45_000_000, false, "보안 시스템 캐시"),
-            ("CloudKit", CacheType::System, 23_000_000, false, "iCloud 동기화 캐시"),
-            ("Logs/DiagnosticReports", CacheType::System, 89_000_000, true, "시스템 진단 로그"),
-            ("Firefox/Profiles/default", CacheType::Browser, 412_000_000, true, "Firefox 프로필 캐시"),
-            ("VS Code/logs", CacheType::Developer, 67_000_000, true, "VS Code 로그"),
-            ("com.docker.docker", CacheType::Developer, 2_100_000_000, true, "Docker 이미지 캐시"),
-        ];
-        
-        for (i, (name, cache_type, size, is_safe, description)) in sample_caches.iter().enumerate() {
-            let path = PathBuf::from(format!("/Users/user/Library/Caches/{}", name));
-            let last_modified = SystemTime::now()
-                .checked_sub(std::time::Duration::from_secs((i * 3600 + 60) as u64))
-                .unwrap_or(SystemTime::now());
-            
-            self.cache_items.push(CacheItem {
-                path,
-                name: name.to_string(),
-                size: *size,
-                last_modified,
-                item_type: cache_type.clone(),
-                is_selected: *is_safe && self.auto_select_safe,
-                is_safe: *is_safe,
-                description: description.to_string(),
-            });
-        }
-        
         self.last_scan_time = Some(SystemTime::now());
+        self.update_filtered_indices();
+        self.refresh_memory();
+        self.state = AppState::Idle;
     }
-    
-    fn update_filtered_items(&mut self) {
-        self.filtered_items = self.cache_items
+
+    fn update_filtered_indices(&mut self) {
+        self.filtered_indices = self
+            .cache_items
             .iter()
-            .filter(|item| {
-                // 타입 필터
-                if !self.selected_types.get(&item.item_type).unwrap_or(&false) {
+            .enumerate()
+            .filter(|(_, item)| {
+                if !self.selected_types.get(&item.item_type).copied().unwrap_or(false) {
                     return false;
                 }
-                
-                // 안전성 필터
                 if !self.show_unsafe && !item.is_safe {
                     return false;
                 }
-                
-                // 텍스트 필터
-                if !self.filter_text.is_empty() {
-                    let search_text = self.filter_text.to_lowercase();
-                    if !item.name.to_lowercase().contains(&search_text) 
-                        && !item.description.to_lowercase().contains(&search_text) {
-                        return false;
-                    }
-                }
-                
                 true
             })
-            .cloned()
+            .map(|(index, _)| index)
             .collect();
-        
-        // 정렬
+
         if self.sort_by_size {
-            self.filtered_items.sort_by(|a, b| b.size.cmp(&a.size));
+            self.filtered_indices.sort_by(|a, b| {
+                let size_a = self.cache_items[*a].size;
+                let size_b = self.cache_items[*b].size;
+                size_b.cmp(&size_a)
+            });
         } else {
-            self.filtered_items.sort_by(|a, b| a.name.cmp(&b.name));
+            self.filtered_indices.sort_by(|a, b| {
+                let name_a = &self.cache_items[*a].name;
+                let name_b = &self.cache_items[*b].name;
+                name_a.cmp(name_b)
+            });
         }
     }
-    
-    fn format_size(bytes: u64) -> String {
-        const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-        let mut size = bytes as f64;
-        let mut unit_index = 0;
-        
-        while size >= 1024.0 && unit_index < UNITS.len() - 1 {
-            size /= 1024.0;
-            unit_index += 1;
-        }
-        
-        if unit_index == 0 {
-            format!("{} {}", bytes, UNITS[unit_index])
-        } else {
-            format!("{:.1} {}", size, UNITS[unit_index])
-        }
-    }
-    
+
     fn total_selected_size(&self) -> u64 {
-        self.filtered_items
+        self.filtered_indices
             .iter()
+            .filter_map(|&index| self.cache_items.get(index))
             .filter(|item| item.is_selected)
             .map(|item| item.size)
             .sum()
     }
-    
+
     fn selected_count(&self) -> usize {
-        self.filtered_items
+        self.filtered_indices
             .iter()
+            .filter_map(|&index| self.cache_items.get(index))
             .filter(|item| item.is_selected)
             .count()
     }
-    
-    fn start_scan(&mut self) {
-        self.state = AppState::Scanning;
-        self.scan_progress = ScanProgress {
-            current_path: "시작 중...".to_string(),
-            scanned_items: 0,
-            total_size: 0,
-            progress: 0.0,
-        };
-        // 실제 구현에서는 여기서 비동기 스캔 시작
-    }
-    
-    fn start_cleaning(&mut self) {
+
+    fn clean_selected(&mut self) {
         self.state = AppState::Cleaning;
         self.cleaning_stats = CleaningStats {
             items_cleaned: 0,
             bytes_freed: 0,
-            time_taken: 0.0,
             errors: Vec::new(),
         };
-        // 실제 구현에서는 여기서 비동기 클리닝 시작
+
+        let indices: Vec<usize> = self.filtered_indices.clone();
+        for index in indices {
+            let Some(item) = self.cache_items.get_mut(index) else {
+                continue;
+            };
+
+            if !item.is_selected {
+                continue;
+            }
+
+            if self.dry_run {
+                self.cleaning_stats.items_cleaned += 1;
+                self.cleaning_stats.bytes_freed += item.size;
+                continue;
+            }
+
+            match std::fs::remove_dir_all(&item.path) {
+                Ok(()) => {
+                    self.cleaning_stats.items_cleaned += 1;
+                    self.cleaning_stats.bytes_freed += item.size;
+                }
+                Err(err) => {
+                    self.cleaning_stats
+                        .errors
+                        .push(format!("{}: {}", item.path.display(), err));
+                }
+            }
+        }
+
+        self.scan_caches();
+        self.state = AppState::Complete;
     }
 }
 
-impl eframe::App for CacheCleanerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 메뉴 이벤트 처리
-        self.handle_menu_events();
+impl Render for CacheCleanerView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let status = match self.state {
+            AppState::Idle => "Idle",
+            AppState::Scanning => "Scanning",
+            AppState::Cleaning => "Cleaning",
+            AppState::Complete => "Complete",
+        };
 
-        // 다이얼로그 표시
-        self.show_dialogs(ctx);
-        
-        // 상단 메뉴바
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.add_space(5.0);
-            ui.horizontal(|ui| {
-                ui.add_space(10.0);
-                
-                // 로고와 타이틀
-                ui.label(egui::RichText::new("🧹 MacSweep")
-                    .size(24.0)
-                    .color(egui::Color32::from_rgb(100, 200, 255)));
-                
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // 상태 표시
-                    let (status_text, status_color) = match self.state {
-                        AppState::Ready => ("준비됨", egui::Color32::GREEN),
-                        AppState::Scanning => ("스캔 중...", egui::Color32::YELLOW),
-                        AppState::Cleaning => ("정리 중...", egui::Color32::ORANGE),
-                        AppState::Complete => ("완료", egui::Color32::GREEN),
-                    };
-                    
-                    ui.colored_label(status_color, egui::RichText::new(status_text).size(14.0));
-                    
-                    if let Some(scan_time) = self.last_scan_time {
-                        let elapsed = scan_time.elapsed().unwrap_or_default().as_secs();
-                        ui.label(format!("마지막 스캔: {}초 전", elapsed));
-                    }
-                });
-            });
-            ui.add_space(5.0);
-        });
-        
-        // 하단 액션 패널
-        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.add_space(10.0);
-                
-                // 선택된 항목 정보
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("선택됨:");
-                        ui.colored_label(
-                            egui::Color32::LIGHT_BLUE, 
-                            format!("{} 항목", self.selected_count())
-                        );
-                        ui.separator();
-                        ui.label("용량:");
-                        ui.colored_label(
-                            egui::Color32::ORANGE, 
-                            Self::format_size(self.total_selected_size())
-                        );
-                    });
-                });
-                
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // 주요 액션 버튼들
-                    let can_clean = self.selected_count() > 0 && matches!(self.state, AppState::Ready);
-                    let can_scan = matches!(self.state, AppState::Ready);
-                    
-                    if ui.add_enabled(can_clean, 
-                        egui::Button::new(if self.dry_run { "🔍 테스트 실행" } else { "🗑️ 정리 시작" })
-                            .fill(if self.dry_run { egui::Color32::from_rgb(100, 150, 200) } else { egui::Color32::from_rgb(220, 100, 100) })
-                            .min_size([120.0, 35.0].into())
-                    ).clicked() {
-                        self.start_cleaning();
-                    }
-                    
-                    if ui.add_enabled(can_scan,
-                        egui::Button::new("🔄 다시 스캔")
-                            .fill(egui::Color32::from_rgb(100, 200, 150))
-                            .min_size([100.0, 35.0].into())
-                    ).clicked() {
-                        self.start_scan();
-                    }
-                    
-                    ui.checkbox(&mut self.dry_run, "테스트 모드");
-                });
-            });
-            ui.add_space(10.0);
-        });
-        
-        // 메인 컨텐츠 영역
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.state {
-                AppState::Scanning => {
-                    // 스캔 진행률 화면
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(50.0);
-                            
-                            ui.label(egui::RichText::new("🔍 캐시 파일 스캔 중...")
-                                .size(24.0)
-                                .color(egui::Color32::LIGHT_BLUE));
-                            
-                            ui.add_space(20.0);
-                            
-                            ui.add(egui::ProgressBar::new(self.scan_progress.progress)
-                                .desired_width(400.0)
-                                .show_percentage());
-                            
-                            ui.add_space(10.0);
-                            ui.label(&self.scan_progress.current_path);
-                            ui.label(format!("발견된 항목: {}", self.scan_progress.scanned_items));
-                            ui.label(format!("총 크기: {}", Self::format_size(self.scan_progress.total_size)));
-                        });
-                    });
-                },
-                
-                AppState::Cleaning => {
-                    // 클리닝 진행률 화면
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(50.0);
-                            
-                            ui.label(egui::RichText::new(if self.dry_run { "🔍 테스트 실행 중..." } else { "🗑️ 캐시 정리 중..." })
-                                .size(24.0)
-                                .color(if self.dry_run { egui::Color32::LIGHT_BLUE } else { egui::Color32::ORANGE }));
-                            
-                            ui.add_space(20.0);
-                            
-                            ui.add(egui::ProgressBar::new(0.7) // 임시 진행률
-                                .desired_width(400.0)
-                                .show_percentage());
-                            
-                            ui.add_space(10.0);
-                            ui.label(format!("처리된 항목: {}", self.cleaning_stats.items_cleaned));
-                            ui.label(format!("확보된 용량: {}", Self::format_size(self.cleaning_stats.bytes_freed)));
-                        });
-                    });
-                },
-                
-                _ => {
-                    // 메인 인터페이스
-                    ui.horizontal(|ui| {
-                        // 왼쪽 사이드바 - 필터 및 옵션
-                        ui.vertical(|ui| {
-                            ui.set_width(280.0);
-                            
-                            // 검색 박스
-                            ui.group(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.strong("🔍 검색");
-                                    ui.add(egui::TextEdit::singleline(&mut self.filter_text)
-                                        .hint_text("이름 또는 설명으로 검색...")
-                                        .desired_width(250.0));
-                                });
-                            });
-                            
-                            ui.add_space(10.0);
-                            
-                            // 캐시 타입 필터
-                            ui.group(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.strong("📁 캐시 유형");
-                                    
-                                    for cache_type in [CacheType::User, CacheType::Developer, CacheType::Browser, CacheType::Application, CacheType::System] {
-                                        ui.horizontal(|ui| {
-                                            let is_enabled = self.selected_types.get(&cache_type).copied().unwrap_or(false);
-                                            let mut enabled = is_enabled;
-                                            
-                                            ui.label(cache_type.icon());
-                                            if ui.checkbox(&mut enabled, match cache_type {
-                                                CacheType::System => "시스템",
-                                                CacheType::User => "사용자",
-                                                CacheType::Developer => "개발도구",
-                                                CacheType::Browser => "브라우저",
-                                                CacheType::Application => "앱",
-                                            }).changed() {
-                                                self.selected_types.insert(cache_type.clone(), enabled);
-                                                self.update_filtered_items();
+        let memory_text = format!(
+            "Memory: {} / {}",
+            format_size(self.memory.used * 1024),
+            format_size(self.memory.total * 1024)
+        );
+
+        let scan_time_text = self
+            .last_scan_time
+            .and_then(|time| time.elapsed().ok())
+            .map(|elapsed| format!("Last scan: {}s ago", elapsed.as_secs()))
+            .unwrap_or_else(|| "Last scan: -".to_string());
+
+        let clean_text = if self.dry_run {
+            "Dry run (no delete)"
+        } else {
+            "Clean selected"
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p(px(16.0))
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .items_center()
+                    .child(format!("MacSweep Memory Cleaner"))
+                    .child(format!("Status: {status}"))
+                    .child(scan_time_text),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(memory_text)
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(0xdddddd))
+                            .border_1()
+                            .border_color(black())
+                            .child("Refresh Memory")
+                            .hover(|style| style.cursor_pointer())
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
+                                this.refresh_memory();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(0xdddddd))
+                            .border_1()
+                            .border_color(black())
+                            .child("Scan Caches")
+                            .hover(|style| style.cursor_pointer())
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
+                                this.scan_caches();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(0xdddddd))
+                            .border_1()
+                            .border_color(black())
+                            .child(clean_text)
+                            .hover(|style| style.cursor_pointer())
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
+                                this.clean_selected();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(0xeeeeee))
+                            .border_1()
+                            .border_color(black())
+                            .child(if self.dry_run { "Dry run: ON" } else { "Dry run: OFF" })
+                            .hover(|style| style.cursor_pointer())
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
+                                this.dry_run = !this.dry_run;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(format!(
+                        "Selected: {} items / {}",
+                        self.selected_count(),
+                        format_size(self.total_selected_size())
+                    ))
+                    .child(format!(
+                        "Cleaned: {} items / {}",
+                        self.cleaning_stats.items_cleaned,
+                        format_size(self.cleaning_stats.bytes_freed)
+                    )),
+            )
+            .child(
+                div()
+                    .border_1()
+                    .border_color(black())
+                    .p(px(8.0))
+                    .bg(white())
+                    .children(
+                        self.filtered_indices
+                            .iter()
+                            .filter_map(|&index| self.cache_items.get(index))
+                            .map(|item| {
+                                let item_name = item.name.clone();
+                                let item_size = format_size(item.size);
+                                let item_path = item.path.clone();
+                                let item_path_label = item.path.display().to_string();
+                                let selected = item.is_selected;
+
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(if selected { "[x]" } else { "[ ]" })
+                                    .child(item_name.clone())
+                                    .child(item_size)
+                                    .child(item_path_label)
+                                    .hover(|style| style.cursor_pointer())
+                                    .on_mouse_up(MouseButton::Left, cx.listener(
+                                        move |this, _e, _w, cx| {
+                                            if let Some(found) = this
+                                                .cache_items
+                                                .iter_mut()
+                                                .find(|entry| entry.path == item_path)
+                                            {
+                                                found.is_selected = !found.is_selected;
+                                                cx.notify();
                                             }
-                                            
-                                            // 아이템 개수 표시
-                                            let count = self.cache_items.iter()
-                                                .filter(|item| item.item_type == cache_type)
-                                                .count();
-                                            if count > 0 {
-                                                ui.small(format!("({})", count));
-                                            }
-                                        });
-                                    }
-                                });
-                            });
-                            
-                            ui.add_space(10.0);
-                            
-                            // 옵션
-                            ui.group(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.strong("⚙️ 옵션");
-                                    
-                                    if ui.checkbox(&mut self.show_unsafe, "위험한 항목 표시").changed() {
-                                        self.update_filtered_items();
-                                    }
-                                    
-                                    if ui.checkbox(&mut self.sort_by_size, "크기순 정렬").changed() {
-                                        self.update_filtered_items();
-                                    }
-                                    
-                                    ui.checkbox(&mut self.auto_select_safe, "안전한 항목 자동 선택");
-                                    
-                                    ui.separator();
-                                    
-                                    // 빠른 액션
-                                    if ui.button("🔘 모두 선택").clicked() {
-                                        for i in 0..self.filtered_items.len() {
-                                            self.filtered_items[i].is_selected = true;
-                                        }
-                                    }
-                                    
-                                    if ui.button("⭕ 모두 해제").clicked() {
-                                        for i in 0..self.filtered_items.len() {
-                                            self.filtered_items[i].is_selected = false;
-                                        }
-                                    }
-                                    
-                                    if ui.button("✅ 안전한 것만").clicked() {
-                                        for i in 0..self.filtered_items.len() {
-                                            self.filtered_items[i].is_selected = self.filtered_items[i].is_safe;
-                                        }
-                                    }
-                                });
-                            });
-                        });
-                        
-                        ui.separator();
-                        
-                        // 메인 캐시 목록
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.heading("캐시 파일 목록");
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.label(format!("{} / {} 항목", 
-                                        self.filtered_items.len(), 
-                                        self.cache_items.len()));
-                                });
-                            });
-                            
-                            ui.separator();
-                            
-                            // 캐시 목록 스크롤 영역
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    let filtered_items_len = self.filtered_items.len();
-                                    
-                                    for i in 0..filtered_items_len {
-                                        ui.group(|ui| {
-                                            ui.horizontal(|ui| {
-                                                // 체크박스 - 분리된 변수로 처리
-                                                let mut is_selected = self.filtered_items[i].is_selected;
-                                                if ui.checkbox(&mut is_selected, "").changed() {
-                                                    self.filtered_items[i].is_selected = is_selected;
-                                                }
-                                                
-                                                // 타입 아이콘과 색상
-                                                ui.colored_label(
-                                                    self.filtered_items[i].item_type.color(), 
-                                                    self.filtered_items[i].item_type.icon()
-                                                );
-                                                
-                                                ui.vertical(|ui| {
-                                                    // 이름
-                                                    ui.horizontal(|ui| {
-                                                        ui.strong(&self.filtered_items[i].name);
-                                                        if !self.filtered_items[i].is_safe {
-                                                            ui.colored_label(egui::Color32::RED, "⚠️");
-                                                        }
-                                                    });
-                                                    
-                                                    // 설명
-                                                    ui.small(&self.filtered_items[i].description);
-                                                    
-                                                    // 경로 (작게)
-                                                    ui.small(format!("📁 {}", self.filtered_items[i].path.display()));
-                                                });
-                                                
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    // 크기
-                                                    ui.vertical(|ui| {
-                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                            ui.strong(Self::format_size(self.filtered_items[i].size));
-                                                            
-                                                            // 수정 시간
-                                                            if let Ok(elapsed) = self.filtered_items[i].last_modified.elapsed() {
-                                                                let days = elapsed.as_secs() / 86400;
-                                                                ui.small(if days == 0 {
-                                                                    "오늘".to_string()
-                                                                } else {
-                                                                    format!("{}일 전", days)
-                                                                });
-                                                            }
-                                                        });
-                                                    });
-                                                });
-                                            });
-                                        });
-                                        
-                                        if i < filtered_items_len - 1 {
-                                            ui.add_space(5.0);
-                                        }
-                                    }
-                                    
-                                    if self.filtered_items.is_empty() {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.vertical_centered(|ui| {
-                                                ui.add_space(50.0);
-                                                ui.label("표시할 캐시 항목이 없습니다");
-                                                ui.small("필터 설정을 확인해보세요");
-                                            });
-                                        });
-                                    }
-                                });
-                        });
-                    });
-                }
-            }
-        });
-        
-        // 시뮬레이션용 상태 변경 (실제 구현에서는 제거)
-        if matches!(self.state, AppState::Scanning) {
-            self.scan_progress.progress = (self.scan_progress.progress + 0.01).min(1.0);
-            if self.scan_progress.progress >= 1.0 {
-                self.state = AppState::Ready;
-                self.generate_sample_data(); // 새로운 데이터 생성
-                self.update_filtered_items();
-            }
-            ctx.request_repaint();
-        }
-        
-        if matches!(self.state, AppState::Cleaning) {
-            self.cleaning_stats.items_cleaned += 1;
-            self.cleaning_stats.bytes_freed += 1000000;
-            if self.cleaning_stats.items_cleaned >= 10 {
-                self.state = AppState::Complete;
-            }
-            ctx.request_repaint();
-        }
+                                        },
+                                    ))
+                            }),
+                    ),
+            )
+            .children(
+                self.cleaning_stats
+                    .errors
+                    .iter()
+                    .map(|err| format!("Error: {}", err)),
+            )
     }
+}
+
+fn classify_cache(name: &str) -> CacheType {
+    let lower = name.to_lowercase();
+    if lower.contains("safari") || lower.contains("chrome") || lower.contains("firefox") {
+        CacheType::Browser
+    } else if lower.contains("xcode") || lower.contains("cargo") || lower.contains("npm") {
+        CacheType::Developer
+    } else if lower.contains("com.apple") || lower.contains("system") {
+        CacheType::System
+    } else if lower.contains("com.") {
+        CacheType::Application
+    } else {
+        CacheType::User
+    }
+}
+
+fn dir_size(path: &Path) -> u64 {
+    WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit_index = 0;
+
+    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        format!("{} {}", bytes, UNITS[unit_index])
+    } else {
+        format!("{:.1} {}", size, UNITS[unit_index])
+    }
+}
+
+fn main() {
+    application().run(|cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            |_, cx| cx.new(|cx| CacheCleanerView::new(cx)),
+        )
+        .unwrap();
+        cx.activate(true);
+    });
 }
