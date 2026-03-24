@@ -7,8 +7,7 @@ use std::time::SystemTime;
 
 use dirs::home_dir;
 use gpui::{
-    App, Application, Bounds, Context, MouseButton, Window, WindowBounds, WindowOptions, div, px,
-    rgb, size, white, black, prelude::*,
+    App, Application, Context, MouseButton, Window, div, px, rgb, white, black, prelude::*,
 };
 use sysinfo::{ProcessesToUpdate, System};
 use walkdir::WalkDir;
@@ -629,15 +628,136 @@ fn format_size(bytes: u64) -> String {
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|cx| CacheCleanerView::new(cx)),
-        )
-        .unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            macos_status_item::setup_status_item();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|cx| CacheCleanerView::new(cx)),
+            )
+            .unwrap();
+        }
+
         cx.activate(true);
     });
+}
+
+#[cfg(target_os = "macos")]
+mod macos_status_item {
+    use cocoa::{
+        appkit::{
+            NSSquareStatusItemLength, NSStatusBar,
+        },
+        base::{id, nil},
+        foundation::{NSPoint, NSRect, NSRectEdge, NSSize, NSString},
+    };
+    use objc::{
+        class, declare::ClassDecl, msg_send,
+        rc::StrongPtr,
+        runtime::{Class, Object, Sel},
+        sel, sel_impl,
+    };
+
+    struct StatusHandles {
+        status_item: StrongPtr,
+        popover: StrongPtr,
+        controller: StrongPtr,
+        view: StrongPtr,
+        target: StrongPtr,
+    }
+
+    thread_local! {
+        static STATUS_HANDLES: std::cell::RefCell<Option<StatusHandles>> =
+            std::cell::RefCell::new(None);
+    }
+
+    pub fn setup_status_item() {
+        unsafe {
+            let status_bar = NSStatusBar::systemStatusBar(nil);
+            let status_item =
+                StrongPtr::retain(status_bar.statusItemWithLength_(NSSquareStatusItemLength));
+            let button: id = msg_send![*status_item, button];
+            let title = NSString::alloc(nil).init_str("RC");
+            let _: () = msg_send![button, setTitle: title];
+
+            let popover: id = msg_send![class!(NSPopover), new];
+            let controller: id = msg_send![class!(NSViewController), new];
+            let view: id = msg_send![class!(NSView), alloc];
+            let view = StrongPtr::new(msg_send![view, initWithFrame: NSRect::new(
+                NSPoint::new(0., 0.),
+                NSSize::new(320., 220.),
+            )]);
+
+            let label: id = msg_send![class!(NSTextField), labelWithString: NSString::alloc(nil).init_str("RustClean")];
+            let _: () = msg_send![label, setFrame: NSRect::new(NSPoint::new(20., 160.), NSSize::new(280., 24.))];
+            let _: () = msg_send![*view, addSubview: label];
+
+            let _: () = msg_send![controller, setView: *view];
+            let _: () = msg_send![popover, setContentViewController: controller];
+            let behavior_transient: i64 = 1;
+            let _: () = msg_send![popover, setBehavior: behavior_transient];
+
+            let target = create_target();
+            let _: () = msg_send![button, setTarget: target];
+            let _: () = msg_send![button, setAction: sel!(togglePopover:)];
+
+            let handles = StatusHandles {
+                status_item,
+                popover: StrongPtr::new(popover),
+                controller: StrongPtr::new(controller),
+                view,
+                target: StrongPtr::new(target),
+            };
+            STATUS_HANDLES.with(|cell| {
+                *cell.borrow_mut() = Some(handles);
+            });
+        }
+    }
+
+    fn create_target() -> id {
+        unsafe {
+            static mut TARGET_CLASS: *const Class = std::ptr::null();
+            if TARGET_CLASS.is_null() {
+                let mut decl = ClassDecl::new("RustCleanStatusTarget", class!(NSObject)).unwrap();
+                decl.add_method(sel!(togglePopover:), toggle_popover as extern "C" fn(&Object, Sel, id));
+                TARGET_CLASS = decl.register();
+            }
+            let target: id = msg_send![TARGET_CLASS, new];
+            target
+        }
+    }
+
+    extern "C" fn toggle_popover(_this: &Object, _sel: Sel, _sender: id) {
+        unsafe {
+            STATUS_HANDLES.with(|cell| {
+                let binding = cell.borrow();
+                let Some(handles) = binding.as_ref() else {
+                    return;
+                };
+                let popover: id = *handles.popover;
+                let status_item: id = *handles.status_item;
+                let button: id = msg_send![status_item, button];
+                let is_shown: bool = msg_send![popover, isShown];
+                if is_shown {
+                    let _: () = msg_send![popover, close];
+                } else {
+                    let bounds: NSRect = msg_send![button, bounds];
+                    let _: () = msg_send![
+                        popover,
+                        showRelativeToRect: bounds
+                        ofView: button
+                        preferredEdge: NSRectEdge::NSRectMinYEdge
+                    ];
+                }
+            });
+        }
+    }
 }

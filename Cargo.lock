@@ -4368,9 +4368,11 @@ dependencies = [
 name = "rustclean"
 version = "0.1.0"
 dependencies = [
+ "cocoa 0.26.0",
  "dirs 6.0.0",
  "fastrand 2.3.0",
  "gpui",
+ "objc",
  "sysinfo 0.37.2",
  "walkdir",
 ]
