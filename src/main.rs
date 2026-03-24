@@ -7,11 +7,10 @@ use std::time::SystemTime;
 
 use dirs::home_dir;
 use gpui::{
-    App, Bounds, Context, MouseButton, Window, WindowBounds, WindowOptions, div, px, rgb, size,
-    white, black, prelude::*,
+    App, Application, Bounds, Context, MouseButton, Window, WindowBounds, WindowOptions, div, px,
+    rgb, size, white, black, prelude::*,
 };
-use gpui_platform::application;
-use sysinfo::System;
+use sysinfo::{ProcessesToUpdate, System};
 use walkdir::WalkDir;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -60,6 +59,13 @@ struct MemoryInfo {
     used: u64,
 }
 
+struct ProcessInfo {
+    pid: u32,
+    name: String,
+    cpu: f32,
+    memory: u64,
+}
+
 struct CleaningStats {
     items_cleaned: usize,
     bytes_freed: u64,
@@ -76,7 +82,10 @@ struct CacheCleanerView {
     auto_select_safe: bool,
     dry_run: bool,
     last_scan_time: Option<SystemTime>,
+    last_process_refresh: Option<SystemTime>,
     memory: MemoryInfo,
+    processes: Vec<ProcessInfo>,
+    system: System,
     cleaning_stats: CleaningStats,
 }
 
@@ -99,7 +108,10 @@ impl CacheCleanerView {
             auto_select_safe: true,
             dry_run: true,
             last_scan_time: None,
+            last_process_refresh: None,
             memory: MemoryInfo { total: 0, used: 0 },
+            processes: Vec::new(),
+            system: System::new_all(),
             cleaning_stats: CleaningStats {
                 items_cleaned: 0,
                 bytes_freed: 0,
@@ -108,17 +120,42 @@ impl CacheCleanerView {
         };
 
         view.refresh_memory();
+        view.refresh_processes();
         view.scan_caches();
         view
     }
 
     fn refresh_memory(&mut self) {
-        let mut system = System::new_all();
-        system.refresh_memory();
+        self.system.refresh_memory();
         self.memory = MemoryInfo {
-            total: system.total_memory(),
-            used: system.used_memory(),
+            total: self.system.total_memory(),
+            used: self.system.used_memory(),
         };
+    }
+
+    fn refresh_processes(&mut self) {
+        self.system
+            .refresh_processes(ProcessesToUpdate::All, true);
+        self.system.refresh_memory();
+        self.system.refresh_cpu_all();
+
+        let mut processes: Vec<ProcessInfo> = self
+            .system
+            .processes()
+            .iter()
+            .map(|(pid, process)| ProcessInfo {
+                pid: pid.as_u32(),
+                name: process.name().to_string_lossy().to_string(),
+                cpu: process.cpu_usage(),
+                memory: process.memory(),
+            })
+            .collect();
+
+        processes.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+        processes.truncate(20);
+
+        self.processes = processes;
+        self.last_process_refresh = Some(SystemTime::now());
     }
 
     fn scan_caches(&mut self) {
@@ -276,6 +313,12 @@ impl Render for CacheCleanerView {
             AppState::Complete => "Complete",
         };
 
+        let app_bg = rgb(0x121417);
+        let panel_bg = rgb(0x1b2026);
+        let card_bg = rgb(0x222833);
+        let accent = rgb(0x6bdcff);
+        let subtle = rgb(0x2a313d);
+
         let memory_text = format!(
             "Memory: {} / {}",
             format_size(self.memory.used * 1024),
@@ -294,18 +337,41 @@ impl Render for CacheCleanerView {
             "Clean selected"
         };
 
+        let process_time_text = self
+            .last_process_refresh
+            .and_then(|time| time.elapsed().ok())
+            .map(|elapsed| format!("Processes: {}s ago", elapsed.as_secs()))
+            .unwrap_or_else(|| "Processes: -".to_string());
+
         div()
             .flex()
             .flex_col()
             .gap_3()
+            .size_full()
             .p(px(16.0))
+            .bg(app_bg)
+            .text_color(white())
             .child(
                 div()
                     .flex()
                     .gap_3()
                     .items_center()
-                    .child(format!("MacSweep Memory Cleaner"))
-                    .child(format!("Status: {status}"))
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .bg(accent)
+                            .text_color(black())
+                            .child("MacSweep"),
+                    )
+                    .child("Smart Clean")
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .bg(subtle)
+                            .child(format!("Status: {status}")),
+                    )
                     .child(scan_time_text),
             )
             .child(
@@ -318,16 +384,31 @@ impl Render for CacheCleanerView {
                         div()
                             .px_2()
                             .py_1()
-                            .bg(rgb(0xdddddd))
+                            .bg(card_bg)
                             .border_1()
-                            .border_color(black())
+                            .border_color(subtle)
                             .child("Refresh Memory")
                             .hover(|style| style.cursor_pointer())
                             .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
                                 this.refresh_memory();
                                 cx.notify();
-                            })),
-                    ),
+                            }))
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .bg(card_bg)
+                            .border_1()
+                            .border_color(subtle)
+                            .child("Refresh Processes")
+                            .hover(|style| style.cursor_pointer())
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
+                                this.refresh_processes();
+                                cx.notify();
+                            }))
+                    )
+                    .child(process_time_text),
             )
             .child(
                 div()
@@ -338,9 +419,9 @@ impl Render for CacheCleanerView {
                         div()
                             .px_2()
                             .py_1()
-                            .bg(rgb(0xdddddd))
+                            .bg(card_bg)
                             .border_1()
-                            .border_color(black())
+                            .border_color(subtle)
                             .child("Scan Caches")
                             .hover(|style| style.cursor_pointer())
                             .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
@@ -352,9 +433,9 @@ impl Render for CacheCleanerView {
                         div()
                             .px_2()
                             .py_1()
-                            .bg(rgb(0xdddddd))
+                            .bg(card_bg)
                             .border_1()
-                            .border_color(black())
+                            .border_color(subtle)
                             .child(clean_text)
                             .hover(|style| style.cursor_pointer())
                             .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
@@ -366,9 +447,9 @@ impl Render for CacheCleanerView {
                         div()
                             .px_2()
                             .py_1()
-                            .bg(rgb(0xeeeeee))
+                            .bg(card_bg)
                             .border_1()
-                            .border_color(black())
+                            .border_color(subtle)
                             .child(if self.dry_run { "Dry run: ON" } else { "Dry run: OFF" })
                             .hover(|style| style.cursor_pointer())
                             .on_mouse_up(MouseButton::Left, cx.listener(|this, _e, _w, cx| {
@@ -381,56 +462,117 @@ impl Render for CacheCleanerView {
                 div()
                     .flex()
                     .gap_3()
-                    .child(format!(
-                        "Selected: {} items / {}",
-                        self.selected_count(),
-                        format_size(self.total_selected_size())
-                    ))
-                    .child(format!(
-                        "Cleaned: {} items / {}",
-                        self.cleaning_stats.items_cleaned,
-                        format_size(self.cleaning_stats.bytes_freed)
-                    )),
+                    .child(
+                        div()
+                            .p(px(8.0))
+                            .bg(panel_bg)
+                            .border_1()
+                            .border_color(subtle)
+                            .child(format!(
+                                "Selected: {} items / {}",
+                                self.selected_count(),
+                                format_size(self.total_selected_size())
+                            )),
+                    )
+                    .child(
+                        div()
+                            .p(px(8.0))
+                            .bg(panel_bg)
+                            .border_1()
+                            .border_color(subtle)
+                            .child(format!(
+                                "Cleaned: {} items / {}",
+                                self.cleaning_stats.items_cleaned,
+                                format_size(self.cleaning_stats.bytes_freed)
+                            )),
+                    ),
             )
             .child(
                 div()
-                    .border_1()
-                    .border_color(black())
-                    .p(px(8.0))
-                    .bg(white())
-                    .children(
-                        self.filtered_indices
-                            .iter()
-                            .filter_map(|&index| self.cache_items.get(index))
-                            .map(|item| {
-                                let item_name = item.name.clone();
-                                let item_size = format_size(item.size);
-                                let item_path = item.path.clone();
-                                let item_path_label = item.path.display().to_string();
-                                let selected = item.is_selected;
-
+                    .flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .bg(panel_bg)
+                            .border_1()
+                            .border_color(subtle)
+                            .p(px(10.0))
+                            .child("Cache Items")
+                            .child(
                                 div()
-                                    .flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(if selected { "[x]" } else { "[ ]" })
-                                    .child(item_name.clone())
-                                    .child(item_size)
-                                    .child(item_path_label)
-                                    .hover(|style| style.cursor_pointer())
-                                    .on_mouse_up(MouseButton::Left, cx.listener(
-                                        move |this, _e, _w, cx| {
-                                            if let Some(found) = this
-                                                .cache_items
-                                                .iter_mut()
-                                                .find(|entry| entry.path == item_path)
-                                            {
-                                                found.is_selected = !found.is_selected;
-                                                cx.notify();
-                                            }
-                                        },
-                                    ))
-                            }),
+                                    .border_1()
+                                    .border_color(subtle)
+                                    .p(px(8.0))
+                                    .bg(card_bg)
+                                    .children(
+                                        self.filtered_indices
+                                            .iter()
+                                            .filter_map(|&index| self.cache_items.get(index))
+                                            .map(|item| {
+                                                let item_name = item.name.clone();
+                                                let item_size = format_size(item.size);
+                                                let item_path = item.path.clone();
+                                                let item_path_label = item.path.display().to_string();
+                                                let selected = item.is_selected;
+
+                                                div()
+                                                    .flex()
+                                                    .gap_2()
+                                                    .items_center()
+                                                    .child(if selected { "[x]" } else { "[ ]" })
+                                                    .child(item_name.clone())
+                                                    .child(item_size)
+                                                    .child(item_path_label)
+                                                    .hover(|style| style.cursor_pointer())
+                                                    .on_mouse_up(MouseButton::Left, cx.listener(
+                                                        move |this, _e, _w, cx| {
+                                                            if let Some(found) = this
+                                                                .cache_items
+                                                                .iter_mut()
+                                                                .find(|entry| entry.path == item_path)
+                                                            {
+                                                                found.is_selected = !found.is_selected;
+                                                                cx.notify();
+                                                            }
+                                                        },
+                                                    ))
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .bg(panel_bg)
+                            .border_1()
+                            .border_color(subtle)
+                            .p(px(10.0))
+                            .child("Top CPU Processes")
+                            .child(
+                                div()
+                                    .border_1()
+                                    .border_color(subtle)
+                                    .p(px(8.0))
+                                    .bg(card_bg)
+                                    .children(self.processes.iter().map(|proc_info| {
+                                        let cpu_text = format!("{:.1}%", proc_info.cpu);
+                                        let mem_text = format_size(proc_info.memory * 1024);
+                                        let pid_text = format!("pid {}", proc_info.pid);
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(proc_info.name.clone())
+                                            .child(cpu_text)
+                                            .child(mem_text)
+                                            .child(pid_text)
+                                    })),
+                            ),
                     ),
             )
             .children(
@@ -486,7 +628,7 @@ fn format_size(bytes: u64) -> String {
 }
 
 fn main() {
-    application().run(|cx: &mut App| {
+    Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
         cx.open_window(
             WindowOptions {
