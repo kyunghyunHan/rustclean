@@ -665,6 +665,10 @@ mod macos_status_item {
         runtime::{Class, Object, Sel},
         sel, sel_impl,
     };
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    use sysinfo::{ProcessesToUpdate, System};
+    use std::collections::HashSet;
 
     struct StatusHandles {
         status_item: StrongPtr,
@@ -672,6 +676,18 @@ mod macos_status_item {
         controller: StrongPtr,
         view: StrongPtr,
         target: StrongPtr,
+        title_label: StrongPtr,
+        cpu_label: StrongPtr,
+        gpu_label: StrongPtr,
+        process_title_label: StrongPtr,
+        process_rows: Vec<ProcessRow>,
+        system: System,
+        last_cpu_refresh: Option<Instant>,
+    }
+
+    struct ProcessRow {
+        label: StrongPtr,
+        button: StrongPtr,
     }
 
     thread_local! {
@@ -693,12 +709,24 @@ mod macos_status_item {
             let view: id = msg_send![class!(NSView), alloc];
             let view = StrongPtr::new(msg_send![view, initWithFrame: NSRect::new(
                 NSPoint::new(0., 0.),
-                NSSize::new(320., 220.),
+                NSSize::new(360., 360.),
             )]);
 
-            let label: id = msg_send![class!(NSTextField), labelWithString: NSString::alloc(nil).init_str("RustClean")];
-            let _: () = msg_send![label, setFrame: NSRect::new(NSPoint::new(20., 160.), NSSize::new(280., 24.))];
-            let _: () = msg_send![*view, addSubview: label];
+            let title_label: id = msg_send![class!(NSTextField), labelWithString: NSString::alloc(nil).init_str("RustClean")];
+            let _: () = msg_send![title_label, setFrame: NSRect::new(NSPoint::new(20., 320.), NSSize::new(300., 24.))];
+            let _: () = msg_send![*view, addSubview: title_label];
+
+            let cpu_label: id = msg_send![class!(NSTextField), labelWithString: NSString::alloc(nil).init_str("CPU: -")];
+            let _: () = msg_send![cpu_label, setFrame: NSRect::new(NSPoint::new(20., 290.), NSSize::new(300., 20.))];
+            let _: () = msg_send![*view, addSubview: cpu_label];
+
+            let gpu_label: id = msg_send![class!(NSTextField), labelWithString: NSString::alloc(nil).init_str("GPU: -")];
+            let _: () = msg_send![gpu_label, setFrame: NSRect::new(NSPoint::new(20., 265.), NSSize::new(300., 20.))];
+            let _: () = msg_send![*view, addSubview: gpu_label];
+
+            let process_title_label: id = msg_send![class!(NSTextField), labelWithString: NSString::alloc(nil).init_str("메모리 상위 프로세스")];
+            let _: () = msg_send![process_title_label, setFrame: NSRect::new(NSPoint::new(20., 235.), NSSize::new(300., 20.))];
+            let _: () = msg_send![*view, addSubview: process_title_label];
 
             let _: () = msg_send![controller, setView: *view];
             let _: () = msg_send![popover, setContentViewController: controller];
@@ -709,12 +737,40 @@ mod macos_status_item {
             let _: () = msg_send![button, setTarget: target];
             let _: () = msg_send![button, setAction: sel!(togglePopover:)];
 
+            let mut process_rows = Vec::new();
+            let base_y = 200.0;
+            let row_height = 28.0;
+            let rows = 5;
+            for i in 0..rows {
+                let y = base_y - (i as f64 * row_height);
+                let label: id = msg_send![class!(NSTextField), labelWithString: NSString::alloc(nil).init_str("-")];
+                let _: () = msg_send![label, setFrame: NSRect::new(NSPoint::new(20., y), NSSize::new(230., 20.))];
+                let _: () = msg_send![*view, addSubview: label];
+
+                let button_title = NSString::alloc(nil).init_str("종료");
+                let button: id = msg_send![class!(NSButton), buttonWithTitle: button_title target: target action: sel!(killProcess:)];
+                let _: () = msg_send![button, setFrame: NSRect::new(NSPoint::new(260., y - 2.0), NSSize::new(70., 24.))];
+                let _: () = msg_send![*view, addSubview: button];
+
+                process_rows.push(ProcessRow {
+                    label: StrongPtr::new(label),
+                    button: StrongPtr::new(button),
+                });
+            }
+
             let handles = StatusHandles {
                 status_item,
                 popover: StrongPtr::new(popover),
                 controller: StrongPtr::new(controller),
                 view,
                 target: StrongPtr::new(target),
+                title_label: StrongPtr::new(title_label),
+                cpu_label: StrongPtr::new(cpu_label),
+                gpu_label: StrongPtr::new(gpu_label),
+                process_title_label: StrongPtr::new(process_title_label),
+                process_rows,
+                system: System::new_all(),
+                last_cpu_refresh: None,
             };
             STATUS_HANDLES.with(|cell| {
                 *cell.borrow_mut() = Some(handles);
@@ -728,6 +784,7 @@ mod macos_status_item {
             if TARGET_CLASS.is_null() {
                 let mut decl = ClassDecl::new("RustCleanStatusTarget", class!(NSObject)).unwrap();
                 decl.add_method(sel!(togglePopover:), toggle_popover as extern "C" fn(&Object, Sel, id));
+                decl.add_method(sel!(killProcess:), kill_process as extern "C" fn(&Object, Sel, id));
                 TARGET_CLASS = decl.register();
             }
             let target: id = msg_send![TARGET_CLASS, new];
@@ -738,8 +795,8 @@ mod macos_status_item {
     extern "C" fn toggle_popover(_this: &Object, _sel: Sel, _sender: id) {
         unsafe {
             STATUS_HANDLES.with(|cell| {
-                let binding = cell.borrow();
-                let Some(handles) = binding.as_ref() else {
+                let mut binding = cell.borrow_mut();
+                let Some(handles) = binding.as_mut() else {
                     return;
                 };
                 let popover: id = *handles.popover;
@@ -749,6 +806,8 @@ mod macos_status_item {
                 if is_shown {
                     let _: () = msg_send![popover, close];
                 } else {
+                    refresh_usage_labels(handles);
+                    refresh_process_list(handles);
                     let bounds: NSRect = msg_send![button, bounds];
                     let _: () = msg_send![
                         popover,
@@ -758,6 +817,161 @@ mod macos_status_item {
                     ];
                 }
             });
+        }
+    }
+
+    fn refresh_usage_labels(handles: &mut StatusHandles) {
+        let cpu_text = match current_cpu_usage_percent(&mut handles.system, &mut handles.last_cpu_refresh) {
+            Some(value) => format!("CPU: {:.1}%", value),
+            None => "CPU: -".to_string(),
+        };
+
+        let gpu_text = match current_gpu_usage_percent() {
+            Some(value) => format!("GPU: {:.0}%", value),
+            None => "GPU: N/A".to_string(),
+        };
+
+        unsafe {
+            set_label_text(*handles.cpu_label, &cpu_text);
+            set_label_text(*handles.gpu_label, &gpu_text);
+        }
+    }
+
+    fn refresh_process_list(handles: &mut StatusHandles) {
+        handles.system
+            .refresh_processes(ProcessesToUpdate::All, true);
+
+        let excluded = default_excluded_processes();
+        let mut processes: Vec<(i32, String, u64)> = handles
+            .system
+            .processes()
+            .iter()
+            .filter_map(|(pid, proc_)| {
+                let name = proc_.name().to_string_lossy().to_string();
+                if excluded.contains(name.as_str()) {
+                    return None;
+                }
+                let mem_kb = proc_.memory();
+                Some((pid.as_u32() as i32, name, mem_kb as u64))
+            })
+            .collect();
+
+        processes.sort_by(|a, b| b.2.cmp(&a.2));
+        processes.truncate(handles.process_rows.len());
+
+        for (index, row) in handles.process_rows.iter().enumerate() {
+            let (pid, label_text, button_enabled) = if let Some((pid, name, mem_kb)) = processes.get(index) {
+                let mem_bytes = mem_kb.saturating_mul(1024);
+                let text = format!("{} ({})", name, super::format_size(mem_bytes));
+                (*pid, text, true)
+            } else {
+                (0, "-".to_string(), false)
+            };
+
+            unsafe {
+                set_label_text(*row.label, &label_text);
+                let _: () = msg_send![*row.button, setTag: pid as isize];
+                let _: () = msg_send![*row.button, setEnabled: button_enabled];
+            }
+        }
+    }
+
+    fn default_excluded_processes() -> HashSet<&'static str> {
+        [
+            "Finder",
+            "WindowServer",
+            "kernel_task",
+            "SystemUIServer",
+            "loginwindow",
+            "Dock",
+            "Spotlight",
+            "NotificationCenter",
+            "ControlCenter",
+            "cfprefsd",
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    extern "C" fn kill_process(_this: &Object, _sel: Sel, sender: id) {
+        unsafe {
+            let pid: i32 = msg_send![sender, tag];
+            if pid <= 0 {
+                return;
+            }
+
+            if !confirm_kill(pid) {
+                return;
+            }
+
+            let _ = libc::kill(pid, libc::SIGTERM);
+        }
+    }
+
+    fn confirm_kill(pid: i32) -> bool {
+        unsafe {
+            let alert: id = msg_send![class!(NSAlert), new];
+            let title = NSString::alloc(nil).init_str("프로세스 종료 확인");
+            let info = NSString::alloc(nil).init_str(&format!("PID {} 프로세스를 종료할까요?", pid));
+            let _: () = msg_send![alert, setMessageText: title];
+            let _: () = msg_send![alert, setInformativeText: info];
+            let yes_title = NSString::alloc(nil).init_str("종료");
+            let no_title = NSString::alloc(nil).init_str("취소");
+            let _: () = msg_send![alert, addButtonWithTitle: yes_title];
+            let _: () = msg_send![alert, addButtonWithTitle: no_title];
+            let response: i32 = msg_send![alert, runModal];
+            response == 1000
+        }
+    }
+
+    fn current_cpu_usage_percent(system: &mut System, last_refresh: &mut Option<Instant>) -> Option<f32> {
+        system.refresh_cpu_all();
+        if last_refresh.is_none() {
+            std::thread::sleep(Duration::from_millis(120));
+            system.refresh_cpu_all();
+        }
+        *last_refresh = Some(Instant::now());
+        Some(system.global_cpu_usage())
+    }
+
+    fn current_gpu_usage_percent() -> Option<f32> {
+        let output = Command::new("ioreg")
+            .args(["-l", "-w0", "-r", "-c", "IOAccelerator"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        extract_ioreg_util(&text, "Device Utilization %")
+            .or_else(|| extract_ioreg_util(&text, "Renderer Utilization %"))
+            .or_else(|| extract_ioreg_util(&text, "Tiler Utilization %"))
+    }
+
+    fn extract_ioreg_util(text: &str, key: &str) -> Option<f32> {
+        let idx = text.find(key)?;
+        let after_key = &text[idx + key.len()..];
+        let eq_idx = after_key.find('=')?;
+        let after_eq = &after_key[eq_idx + 1..];
+        let mut digits = String::new();
+        for ch in after_eq.chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                digits.push(ch);
+            } else if !digits.is_empty() {
+                break;
+            }
+        }
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse::<f32>().ok()
+        }
+    }
+
+    unsafe fn set_label_text(label: id, text: &str) {
+        let ns_text = unsafe { NSString::alloc(nil).init_str(text) };
+        unsafe {
+            let _: () = msg_send![label, setStringValue: ns_text];
         }
     }
 }
